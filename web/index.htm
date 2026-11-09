@@ -73,6 +73,8 @@
             <label class="btn btn-outline-secondary d-flex align-items-center justify-content-center" for="modeTube"><img src="/itube.webp" class="me-2" alt=""> Tube</label>
             <input type="radio" class="btn-check" name="boardmode" id="modeBus" value="2" autocomplete="off">
             <label class="btn btn-outline-secondary d-flex align-items-center justify-content-center" for="modeBus"><img src="/ibus.webp" class="me-2" alt=""> Bus</label>
+            <input type="radio" class="btn-check" name="boardmode" id="modeFreight" value="3" autocomplete="off">
+            <label class="btn btn-outline-secondary d-flex align-items-center justify-content-center" for="modeFreight">Freight</label>
           </div>
         </div>
 
@@ -176,6 +178,27 @@
                 href="https://github.com/gadec-uk/departures-board/#bus-stop-atco-codes" target="_blank">here</a> for
               full instructions.</div>
           </div>
+        </div>
+
+        <div class="mb-3" id="freightBox" style="display:none">
+          <label class="form-label" for="freightUrl">freight-tracker server</label>
+          <input id="freightUrl" type="text" maxlength="63" placeholder="http://192.168.68.137:8090" class="form-control">
+          <label class="form-label mt-2" for="freightTiploc">Timing point (TIPLOC)</label>
+          <div style="display:flex;gap:10px;">
+            <div style="flex:1;">
+              <input id="freightTiploc" type="text" maxlength="7" placeholder="e.g. ASHJN" class="form-control"
+                style="width:100%;text-transform:uppercase;">
+            </div>
+            <div style="flex-shrink:0;">
+              <button id="testFreight" class="btn btn-secondary" type="button">Test</button>
+            </div>
+          </div>
+          <div class="form-text" id="freightResult"></div>
+          <label class="form-label mt-2" for="freightName">Display name</label>
+          <input id="freightName" type="text" maxlength="40" placeholder="Name shown on the board (Test fills this in)" class="form-control">
+          <div class="form-text">Shows freight and other non-passenger trains at any timing point, from a
+            <b>freight-tracker</b> server on your network (darwin-connect/freight-tracker). The TIPLOC must be in the
+            server's <code>watch</code> list.</div>
         </div>
 
         <div class="mb-3" id="scheduleActionButtons" style="padding-top:15px;">
@@ -817,7 +840,10 @@
       busIdOK: false,
       busFilter: "",
       busFilterOK: true,
-      boardMode: 0, //0=Rail, 1=Tube, 2=Bus
+      freightUrl: "",
+      freightTiploc: "",
+      freightName: "",
+      boardMode: 0, //0=Rail, 1=Tube, 2=Bus, 3=Freight
       appKey: "",
       callingStationSelected: false,
       callingStation: "",
@@ -1405,6 +1431,48 @@
       await checkUpgradeNotice();
     });
 
+    function freightSettingsOK() {
+      return /^https?:\/\/[^\s]+$/i.test(appState.freightUrl) && /^[A-Z0-9]{3,7}$/.test(appState.freightTiploc);
+    }
+
+    function readFreightInputs() {
+      appState.freightUrl = document.getElementById("freightUrl").value.trim().replace(/\/+$/, "");
+      appState.freightTiploc = document.getElementById("freightTiploc").value.trim().toUpperCase();
+      appState.freightName = document.getElementById("freightName").value.trim();
+      applyBoardMode();
+    }
+
+    ["freightUrl", "freightTiploc", "freightName"].forEach(id =>
+      document.getElementById(id).addEventListener("input", readFreightInputs));
+
+    document.getElementById("testFreight").addEventListener("click", async function () {
+      readFreightInputs();
+      const out = document.getElementById("freightResult");
+      if (!freightSettingsOK()) {
+        out.innerHTML = "Enter a server URL (http://host:port) and a TIPLOC first.";
+        return;
+      }
+      out.innerHTML = "Checking...";
+      try {
+        const r = await fetch(`${appState.freightUrl}/board/${appState.freightTiploc}.json`, { cache: "no-store" });
+        const data = await r.json();
+        if (!r.ok) {
+          out.innerHTML = `<span class="text-danger">${data.error || ("HTTP " + r.status)}</span>` +
+            (data.watch ? ` (server watches: ${data.watch.join(", ")})` : "");
+          return;
+        }
+        if (!appState.freightName) {
+          appState.freightName = data.loc;
+          document.getElementById("freightName").value = data.loc;
+        }
+        const next = data.svcs.slice(0, 3).map(t => `${t.t} ${t.hc} ${t.st}`).join(", ");
+        out.innerHTML = `OK: <b>${data.loc}</b>, ${data.svcs.length} train(s) listed${next ? " - " + next : ""}`;
+        applyBoardMode();
+      } catch (err) {
+        out.innerHTML = `<span class="text-danger">Could not reach the server from this browser (${err.message}).</span>`;
+      }
+    });
+
     $("input[name=boardmode]").on("change", function () {
       appState.boardMode = parseInt(this.value);
       applyBoardMode();
@@ -1599,6 +1667,7 @@
       const rail = (mode === 0 && (appState.validNatRailToken || appState.validRdgRailToken));
       const tube = (mode === 1);
       const bus = (mode === 2);
+      const freight = (mode === 3);
 
       show("nrT", rail);
       show("nrSearchBox", rail);
@@ -1627,6 +1696,7 @@
       show("busT", bus);
       show("busAtcoBox", bus);
       show("btAtt", bus);
+      show("freightBox", freight);
       if (bus) {
         renderAtcoHistory();
         const iframe = document.querySelector('#bustimesMap');
@@ -1639,7 +1709,8 @@
       if (
         (rail && appState.stationName) ||
         (tube && appState.tubeName) ||
-        (bus && appState.busIdOK)
+        (bus && appState.busIdOK) ||
+        (freight && freightSettingsOK())
       ) {
         enableSave(true);
       } else {
@@ -1654,6 +1725,7 @@
       document.getElementById("modeRail").checked = (mode === 0);
       document.getElementById("modeTube").checked = (mode === 1);
       document.getElementById("modeBus").checked = (mode === 2);
+      document.getElementById("modeFreight").checked = (mode === 3);
     }
 
     function validateAtcoFormat() {
@@ -1698,6 +1770,10 @@
             config.lon = appState.tubeLon;
             config.filter = [appState.tubeLineId !== "all" ? `Line: ${appState.tubeLineId}` : "",
                               appState.tubeDirection ? `Dir: ${appState.tubeDirection}` : ""].filter(Boolean).join(", ");
+        } else if (appState.boardMode === 3) { // Freight
+            config.name = appState.freightName || appState.freightTiploc;
+            config.freightTiploc = appState.freightTiploc;
+            config.filter = `TIPLOC: ${appState.freightTiploc}`;
         } else { // Bus
             config.name = appState.busName;
             config.busId = appState.busId;
@@ -1717,6 +1793,7 @@
             if (mode === 0) return '<img src="/irail.webp" style="height:13px; margin-right:6px; vertical-align:middle;">';
             if (mode === 1) return '<img src="/itube.webp" style="height:13px; margin-right:6px; vertical-align:middle;">';
             if (mode === 2) return '<img src="/ibus.webp" style="height:13px; margin-right:6px; vertical-align:middle;">';
+            if (mode === 3) return '<span class="badge bg-dark me-1" style="vertical-align:middle;">FRT</span>';
             return '';
         };
 
@@ -1802,6 +1879,9 @@
       appState.busLon = s.busLon ?? 0;
       appState.busIdOK = appState.busId.length > 0 && appState.busName.length > 0;
       appState.busFilter = s.busFilter || "";
+      appState.freightUrl = s.freightUrl || "";
+      appState.freightTiploc = s.freightTiploc || "";
+      appState.freightName = s.freightName || "";
       appState.boardMode = s.mode ?? (s.tube != undefined ? (s.tube ? 1 : 0) : 0);
       delete s.tube;
       elements.dataSource.value = s.dataSource ?? (appState.validRdgRailToken ? 1 : 0);
@@ -1820,6 +1900,9 @@
       elements.tubeDirectionFilter.value = appState.tubeDirection;
       elements.busAtco.value = appState.busId;
       elements.busFilter.value = appState.busFilter;
+      document.getElementById("freightUrl").value = appState.freightUrl;
+      document.getElementById("freightTiploc").value = appState.freightTiploc;
+      document.getElementById("freightName").value = appState.freightName;
       elements.brightness.value = s.brightness ?? 50;
       elements.brightnessNight.value = s.brightnessNight ?? 20;
       const pct = (elements.brightness.value / 255) * 100;
@@ -2076,6 +2159,9 @@
         s.busLon = appState.busLon;
         s.busFilter = appState.busFilter;
       }
+      s.freightUrl = appState.freightUrl;
+      s.freightTiploc = appState.freightTiploc;
+      s.freightName = appState.freightName;
       if (isChecked("optTZ") && elements.customTZ.value.trim().length) s.TZ = elements.customTZ.value.trim(); else delete s.TZ;
       if (isChecked("optHost") && elements.customHost.value.trim().length) s.hostname = elements.customHost.value.trim(); else delete s.hostname;
       s.enableScheduler = document.getElementById('enableScheduler').checked;

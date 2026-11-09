@@ -39,6 +39,7 @@
 #include <FS.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
+#include <esp_ota_ops.h>
 #include <weatherClient.h>
 #include <sharedDataStructs.h>
 #include <responseCodes.h>
@@ -46,6 +47,7 @@
 #include <rdmRailClient.h>
 #include <TfLdataClient.h>
 #include <busDataClient.h>
+#include <freightDataClient.h>
 #include <githubClient.h>
 #include <rssClient.h>
 #include <touchSensor.h>
@@ -308,12 +310,14 @@ static const uint8_t UndergroundClock8[150] U8G2_FONT_SECTION("UndergroundClock8
 static const char nrAttributionn[] = "Powered by National Rail Enquiries";
 static const char rdgAttribution[] = "Powered by Rail Delivery Group";
 static const char btAttribution[] = "Powered by bustimes.org";
+static const char frAttribution[] = "Network Rail open data via freight-tracker";
 
 #define SCREENSAVERINTERVAL 8000      // How often the screen is changed in sleep mode (ms - 8 seconds)
 #define DATAUPDATEINTERVAL 90000      // How often we fetch data from National Rail (ms - 1.5 mins) - "default" option
 #define FASTDATAUPDATEINTERVAL 40000  // How often we fetch data from National Rail (ms - 45 secs) - "fast" option
 #define UGDATAUPDATEINTERVAL 30000    // How often we fetch data from TfL (ms - 30 secs)
 #define BUSDATAUPDATEINTERVAL 45000   // How often we fetch data from bustimes.org (ms - 45 secs)
+#define FREIGHTDATAUPDATEINTERVAL 30000 // How often we fetch data from the freight-tracker server (ms - 30 secs, LAN)
 #define RSSUPDATEINTERVAL 600000      // How often to refresh the RSS feed (ms - 10 mins)
 #define WEATHERUPDATEINTERVAL 1200000 // How often to update the weather forecast (ms - 20 mins)
 
@@ -333,6 +337,7 @@ rdmRailClient rdmRailData(&xfrStation,&xfrMessages,&jsonKeyBuffer);
 raildataXmlClient darwinRailData(&xfrStation,&xfrMessages,&jsonKeyBuffer);
 TfLdataClient tfldata(&xfrBusTubeStation,&xfrMessages,&jsonKeyBuffer);
 busDataClient busdata(&xfrBusTubeStation,&jsonKeyBuffer);
+freightDataClient freightdata(&jsonKeyBuffer);
 weatherClient currentWeather(&jsonKeyBuffer);
 rssClient rss(&jsonKeyBuffer);
 github ghUpdate(&jsonKeyBuffer);
@@ -425,6 +430,8 @@ static float locationLon=0;
 static bool railIsSet = false;
 static bool tubeIsSet = false;
 static bool busIsSet = false;
+static bool freightIsSet = false;
+static char freightUrl[MAXFREIGHTURLSIZE] = "";  // freight-tracker server, e.g. http://192.168.68.137:8090
 static bool schedulerActive = false;
 static bool carouselActive = false;
 static int activeSlotEventTime;
@@ -446,8 +453,11 @@ enum boardModes {
   MODE_NEXTSCHEDULE = -3,
   MODE_RAIL = 0,
   MODE_TUBE = 1,
-  MODE_BUS = 2
+  MODE_BUS = 2,
+  MODE_FREIGHT = 3   // freight / non-passenger movements at a TIPLOC (uses the bus board layout)
 };
+// Bus and freight share the bus board layout and processing loop
+#define BUSLAYOUT (boardMode == MODE_BUS || boardMode == MODE_FREIGHT)
 boardModes boardMode = MODE_RAIL;
 
 // National Rail entry point
@@ -594,9 +604,13 @@ void progressBar(const char *text, int percent) {
   drawProgressBar(percent);
 }
 
+#ifndef FIRMWARE_VARIANT
+#define FIRMWARE_VARIANT ""
+#endif
+
 void drawFirmware() {
-  char firmware[16];
-  sprintf(firmware,"B%d.%d-W%d.%d",VERSION_MAJOR,VERSION_MINOR,WEBAPPVER_MAJOR,WEBAPPVER_MINOR);
+  char firmware[20];
+  sprintf(firmware,"B%d.%d-W%d.%d%s",VERSION_MAJOR,VERSION_MINOR,WEBAPPVER_MAJOR,WEBAPPVER_MINOR,FIRMWARE_VARIANT);
    u8g2.drawStr(0,53,firmware);
 }
 
@@ -610,7 +624,7 @@ void drawStartupHeading() {
 void drawStationHeader(const char *stopName, const char *callingStopName, const char *platFilter, const int timeOffset) {
 
   // Clear the top line
-  if (boardMode == MODE_TUBE || boardMode == MODE_BUS) {
+  if (boardMode == MODE_TUBE || BUSLAYOUT) {
     blankArea(0,ULINE0,256,ULINE1-1);
   } else {
     blankArea(0,LINE0,256,LINE1-1);
@@ -866,6 +880,9 @@ void showNoDataScreen() {
     case MODE_BUS:
       strcpy(msg,"No data available for the selected bus stop.");
       break;
+    case MODE_FREIGHT:
+      strcpy(msg,"No data from the freight-tracker server.");
+      break;
   }
   centreText(msg,-1);
   u8g2.setFont(NatRailSmall9);
@@ -934,6 +951,9 @@ void showTokenErrorScreen() {
     case MODE_BUS:
       centreText("Access to the bustimes database denied.",-1);
       break;
+    case MODE_FREIGHT:
+      centreText("Access to the freight-tracker server denied.",-1);
+      break;
   }
   u8g2.setFont(NatRailSmall9);
   centreText("You must enter a valid api key, please",14);
@@ -957,6 +977,9 @@ void showCRSErrorScreen() {
       break;
     case MODE_BUS:
       sprintf(msg,"The atco code \"%s\" is not valid.",locationCode);
+      break;
+    case MODE_FREIGHT:
+      sprintf(msg,"The TIPLOC \"%s\" is not being tracked.",locationCode);
       break;
   }
   centreText(msg,-1);
@@ -1230,6 +1253,7 @@ void resetLocationIds() {
   railIsSet = false;
   tubeIsSet = false;
   busIsSet = false;
+  freightIsSet = false;
 }
 
 void saveFirmwareInfo() {
@@ -1258,19 +1282,14 @@ bool pruneFromPhrase(char* input, const char* target) {
 
 void loadSlot(JsonObjectConst slot, bool isDefault, boardModes requestedMode) {
   if (requestedMode == MODE_NEXTMODE) {
-    switch (boardMode) {
-      case MODE_RAIL:
-        if (tubeIsSet) boardMode = MODE_TUBE;
-        else if (busIsSet) boardMode = MODE_BUS;
+    // Cycle Rail -> Tube -> Bus -> Freight -> Rail, skipping modes that aren't configured
+    const bool isSet[4] = {railIsSet, tubeIsSet, busIsSet, freightIsSet};
+    for (int step = 1; step <= 4; step++) {
+      int candidate = ((int)boardMode + step) % 4;
+      if (isSet[candidate]) {
+        boardMode = (boardModes)candidate;
         break;
-      case MODE_TUBE:
-        if (busIsSet) boardMode = MODE_BUS;
-        else if (railIsSet) boardMode = MODE_RAIL;
-        break;
-      case MODE_BUS:
-        if (railIsSet) boardMode = MODE_RAIL;
-        else if (tubeIsSet) boardMode = MODE_TUBE;
-        break;
+      }
     }
   } else {
     if (slot["mode"].is<int>()) boardMode = slot["mode"];
@@ -1319,6 +1338,19 @@ void loadSlot(JsonObjectConst slot, bool isDefault, boardModes requestedMode) {
       }
       break;
 
+    case MODE_FREIGHT:
+      if (slot["freightTiploc"].is<const char*>()) strlcpy(locationCode, slot["freightTiploc"], sizeof(locationCode));
+      locationFilter[0] = '\0';
+      if (isDefault) {
+        if (slot["freightName"].is<const char*>()) strlcpy(locationName, slot["freightName"], sizeof(locationName));
+      } else {
+        if (slot["name"].is<const char*>())        strlcpy(locationName, slot["name"], sizeof(locationName));
+      }
+      if (!locationName[0]) strlcpy(locationName, locationCode, sizeof(locationName));
+      locationLat = 0;   // no weather for timing points
+      locationLon = 0;
+      break;
+
   }
 }
 
@@ -1349,6 +1381,8 @@ void loadConfig(bool coldBoot = false, boardModes requestedMode = MODE_LOADCONFI
         if (settings["crs"].is<const char*>() && strlen(settings["crs"])) railIsSet = true; else railIsSet = false;
         if (settings["tubeId"].is<const char*>() && strlen(settings["tubeId"])) tubeIsSet = true; else tubeIsSet = false;
         if (settings["busId"].is<const char*>() && strlen(settings["busId"])) busIsSet = true; else busIsSet = false;
+        if (settings["freightUrl"].is<const char*>()) strlcpy(freightUrl, settings["freightUrl"], sizeof(freightUrl)); else freightUrl[0] = '\0';
+        freightIsSet = freightUrl[0] && settings["freightTiploc"].is<const char*>() && strlen(settings["freightTiploc"]);
 
         if (settings["hostname"].is<const char*>())   strlcpy(hostname, settings["hostname"], sizeof(hostname));
         if (settings["wsdlHost"].is<const char*>())   strlcpy(wsdlHost, settings["wsdlHost"], sizeof(wsdlHost));
@@ -1606,7 +1640,7 @@ void softResetBoard(boardModes requestedMode) {
       progressBar("Updating RSS headlines feed",50);
       updateRssFeed();
     }
-  } else if (rssEnabled && previousMode != boardMode && boardMode != MODE_BUS) {
+  } else if (rssEnabled && previousMode != boardMode && !BUSLAYOUT) {
     buildRssMessage();
   }
 
@@ -1637,6 +1671,11 @@ void softResetBoard(boardModes requestedMode) {
       // Create a cleaned filter
       busdata.cleanFilter(locationFilter,locationCleanFilter,sizeof(locationFilter));
       break;
+
+    case MODE_FREIGHT:
+      progressBar("Initialising freight-tracker interface",70);
+      locationCleanFilter[0] = '\0';
+      break;
   }
   station.numServices=0;
   messages.numMessages=0;
@@ -1657,7 +1696,7 @@ void switchToNextMode() {
     softResetBoard(MODE_LOADCONFIG);
   }
   else if (schedulerActive) softResetBoard(MODE_NEXTSCHEDULE);
-  else if (railIsSet+tubeIsSet+busIsSet > 1) softResetBoard(MODE_NEXTMODE); // Check there's at least two configured modes
+  else if (railIsSet+tubeIsSet+busIsSet+freightIsSet > 1) softResetBoard(MODE_NEXTMODE); // Check there's at least two configured modes
 }
 
 // WiFiManager callback, entered config mode
@@ -2170,7 +2209,11 @@ void drawBusService(int serviceId, int y, int destPos) {
 
     u8g2.drawStr(0,y-1,station.service[serviceId].via);
     int etdWidth = 25;
-    if (isDigit(station.service[serviceId].etd[0])) {
+    if (boardMode == MODE_FREIGHT) {
+      // Freight: right column is the status text ("On time", "Exp 10:58", "Not active", "Cancelled"...)
+      strlcpy(etd,station.service[serviceId].etd,sizeof(etd));
+      etdWidth = getStringWidth(etd) + 1;
+    } else if (isDigit(station.service[serviceId].etd[0])) {
       sprintf(etd,"Exp %s",station.service[serviceId].etd);
       etdWidth = 47;
     } else strcpy(etd,station.service[serviceId].sTime);
@@ -2189,6 +2232,15 @@ void drawBusService(int serviceId, int y, int destPos) {
     }
     u8g2.drawStr(destPos,y-1,clipDestination);
   }
+}
+
+const char* busLayoutNoServicesText() {
+  return (boardMode == MODE_FREIGHT) ? "No freight trains booked here in the next 24 hours."
+                                     : "There are no scheduled services at this stop.";
+}
+
+const char* busLayoutAttribution() {
+  return (boardMode == MODE_FREIGHT) ? frAttribution : btAttribution;
 }
 
 // Draw/update the Bus Departures Board
@@ -2226,10 +2278,48 @@ void drawBusDeparturesBoard() {
       if (station.numServices>1) drawBusService(1,ULINE2,busDestX);
     } else {
       u8g2.setFont(NatRailSmall9);
-      centreText("There are no scheduled services at this stop.",ULINE1-1);
+      centreText(busLayoutNoServicesText(),ULINE1-1);
     }
   }
   u8g2.sendBuffer();
+}
+
+// Fit a message into the screen width for the (non-scrolling) third line
+static void fitToScreen(char *msg) {
+  if (getStringWidth(msg) <= SCREEN_WIDTH - 4) return;
+  size_t len = strlen(msg);
+  while (len > 3 && getStringWidth(msg) > SCREEN_WIDTH - 4 - 10) msg[--len] = '\0';
+  strcat(msg,"...");
+}
+
+void updateFreightDepartures() {
+  freightdata.loadBoard(&station);
+  lastDataLoadTime = millis();
+  noDataLoaded = false;
+  dataLoadSuccess++;
+  dataLoadFailure = 0;
+  // Use the server's name for the location if the config didn't give one
+  if (strcmp(locationName,locationCode) == 0 && freightdata.locationName()[0]) {
+    strlcpy(locationName,freightdata.locationName(),sizeof(locationName));
+  }
+  // Width of the left column ("10:57 6C92")
+  busDestX=0;
+  u8g2.setFont(NatRailSmall9);
+  for (int i=0;i<station.numServices;i++) {
+    int w = getStringWidth(station.service[i].via);
+    busDestX = (busDestX > w) ? busDestX : w;
+  }
+  busDestX+=5;
+  // Third line messages: details of the two trains on screen, then weather/attribution
+  int n = 0;
+  for (int i=0;i<station.numServices && i<2 && n<MAXBOARDMESSAGES;i++) {
+    freightdata.serviceDetail(i,line2[n],sizeof(line2[n]));
+    fitToScreen(line2[n]);
+    n++;
+  }
+  if (weatherEnabled && weatherMsg[0]) strcpy(line2[n++],weatherMsg);
+  strcpy(line2[n++],frAttribution);
+  messages.numMessages=n;
 }
 
 void updateBusDepartures() {
@@ -2254,6 +2344,10 @@ void updateBusDepartures() {
     strcpy(line2[0],btAttribution);
     messages.numMessages=1;
   }
+}
+
+void updateBusLayoutDepartures() {
+  if (boardMode == MODE_FREIGHT) updateFreightDepartures(); else updateBusDepartures();
 }
 
 /*
@@ -2494,6 +2588,10 @@ void handleInfo(AsyncWebServerRequest *request) {
     case MODE_BUS:
       message+=String(jsonKeyBuffer.lastResultMessage);
       break;
+
+    case MODE_FREIGHT:
+      message+="freightClient (" + String(freightUrl) + "): " + String(jsonKeyBuffer.lastResultMessage);
+      break;
   }
   message+="\nUpdate result code: ";
   message+=getResultCodeText(lastUpdateResult);
@@ -2522,6 +2620,62 @@ void handleRoot(AsyncWebServerRequest *request) {
 }
 
 // Send the firmware version to the client (called from index.htm)
+//
+// Rollback support: boot the firmware in the other OTA slot (e.g. the stock firmware that was
+// running before this build was uploaded via /update).
+//
+// Stock firmware doesn't know MODE_FREIGHT (3) and would stall on the startup screen if the saved
+// config selects it, so freight is removed from the active mode and the scheduler/carousel first.
+static void makeConfigSafeForStockFirmware() {
+  if (!LittleFS.exists("/config.json")) return;
+  JsonDocument doc;
+  File file = LittleFS.open("/config.json", "r");
+  if (!file) return;
+  DeserializationError err = deserializeJson(doc, file);
+  file.close();
+  if (err) return;
+
+  int safeMode = railIsSet ? MODE_RAIL : (tubeIsSet ? MODE_TUBE : (busIsSet ? MODE_BUS : MODE_RAIL));
+  if ((doc["mode"] | 0) == MODE_FREIGHT) doc["mode"] = safeMode;
+  for (const char* listName : {"scheduler", "carousel"}) {
+    JsonArray list = doc[listName].as<JsonArray>();
+    if (list.isNull()) continue;
+    for (int i = list.size() - 1; i >= 0; i--) {
+      if ((list[i]["mode"] | 0) == MODE_FREIGHT) list.remove(i);
+    }
+  }
+  String out;
+  serializeJson(doc, out);
+  saveFile("/config.json", out);
+}
+
+void handleRollback(AsyncWebServerRequest *request) {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  const esp_partition_t* other = esp_ota_get_next_update_partition(NULL);
+  esp_app_desc_t desc;
+  if (!other || esp_ota_get_partition_description(other, &desc) != ESP_OK) {
+    sendResponse(404, "There is no firmware in the other slot to roll back to.\n\nReinstall the official firmware.bin from https://github.com/gadec-uk/departures-board/releases via /update instead.", request);
+    return;
+  }
+  char info[400];
+  snprintf(info, sizeof(info),
+    "Running: slot %s (this build, freight mode)\nOther slot %s contains firmware built %s %s (IDF %s)\n",
+    running ? running->label : "?", other->label, desc.date, desc.time, desc.idf_ver);
+
+  if (!request->hasParam("confirm")) {
+    sendResponse(200, String(info) + "\nTo boot the other slot, open /rollback?confirm=1\n"
+      "Freight entries are removed from the board mode, scheduler and carousel first so the stock firmware can start.", request);
+    return;
+  }
+  makeConfigSafeForStockFirmware();
+  if (esp_ota_set_boot_partition(other) != ESP_OK) {
+    sendResponse(500, String(info) + "\nThe other slot failed verification; not switching.", request);
+    return;
+  }
+  sendResponse(200, String(info) + "\nSwitched. Restarting into the other firmware now.", request);
+  restartTimer.once(1, []() { ESP.restart(); });
+}
+
 void handleFirmwareInfo(AsyncWebServerRequest *request) {
   String response = "{\"firmware\":\"B" + String(VERSION_MAJOR) + "." + String(VERSION_MINOR) + "-W" + String(WEBAPPVER_MAJOR) + "." + String(WEBAPPVER_MINOR) + "\"}";
   request->send(200,contentTypeJson,response);
@@ -3046,7 +3200,7 @@ void busDeparturesLoop() {
 
   if (fetchComplete && lastUpdateResult == UPD_NO_CHANGE) {
     fetchComplete=false;
-    updateBusDepartures();
+    updateBusLayoutDepartures();
     // Draw the primary service line(s)
     if (station.numServices) {
       drawBusService(0,ULINE1,busDestX);
@@ -3054,7 +3208,7 @@ void busDeparturesLoop() {
     } else {
       u8g2.setFont(NatRailSmall9);
       blankArea(0,ULINE1,256,ULINE3-ULINE1);
-      centreText("There are no scheduled services at this stop.",ULINE1-1);
+      centreText(busLayoutNoServicesText(),ULINE1-1);
     }
     fullRefresh = true;
   }
@@ -3062,7 +3216,7 @@ void busDeparturesLoop() {
   if (fetchComplete && lastUpdateResult != UPD_NO_CHANGE && !isScrollingService && !isScrollingPrimary && !isSleeping) {
     fetchComplete = false;
     if (lastUpdateResult == UPD_SUCCESS) {
-      updateBusDepartures();
+      updateBusLayoutDepartures();
       drawBusDeparturesBoard();
     } else if (lastUpdateResult == UPD_DATA_ERROR || lastUpdateResult == UPD_TIMEOUT || lastUpdateResult == UPD_HTTP_ERROR) {
       lastLoadFailure = millis();
@@ -3141,7 +3295,7 @@ void busDeparturesLoop() {
     // we're scrolling the primary service(s) into view
     u8g2.setClipWindow(0,ULINE1,256,ULINE1+10);
     if (station.numServices) drawBusService(0,scrollPrimaryYpos+ULINE1-1,busDestX);
-    else centreText("There are no scheduled services at this stop.",scrollPrimaryYpos+ULINE1-1);
+    else centreText(busLayoutNoServicesText(),scrollPrimaryYpos+ULINE1-1);
     if (station.numServices>1) {
       u8g2.setClipWindow(0,ULINE2,256,ULINE2+10);
       drawBusService(1,scrollPrimaryYpos+ULINE2-1,busDestX);
@@ -3152,7 +3306,7 @@ void busDeparturesLoop() {
     } else if (station.numServices<3 && messages.numMessages==1) {
       // scroll up the attribution once...
       u8g2.setClipWindow(0,ULINE3,256,ULINE3+10);
-      centreText(btAttribution,scrollPrimaryYpos+ULINE3-1);
+      centreText(busLayoutAttribution(),scrollPrimaryYpos+ULINE3-1);
     }
     u8g2.setMaxClipWindow();
     scrollPrimaryYpos--;
@@ -3199,6 +3353,10 @@ void fetchDeparturesTask(void *pvParameters) {
           case MODE_BUS:
             lastUpdateResult = busdata.fetchDepartures(&station,locationCode,locationCleanFilter);
             nextDataUpdate = millis() + BUSDATAUPDATEINTERVAL;
+            break;
+          case MODE_FREIGHT:
+            lastUpdateResult = freightdata.fetchBoard(&station,freightUrl,locationCode);
+            nextDataUpdate = millis() + FREIGHTDATAUPDATEINTERVAL;
             break;
         }
         fetchComplete = true;
@@ -3316,6 +3474,7 @@ void setup(void) {
   server.on("/brightness", HTTP_GET, [](AsyncWebServerRequest *request){handleBrightness(request);});
   server.on("/ota", HTTP_GET, [](AsyncWebServerRequest *request){handleOtaUpdate(request);});
   server.on("/control", HTTP_GET, [](AsyncWebServerRequest *request){handleControl(request);});
+  server.on("/rollback", HTTP_GET, [](AsyncWebServerRequest *request){handleRollback(request);});
   server.on("/success", HTTP_GET, [](AsyncWebServerRequest *request){request->send(200,contentTypeHtml,successPage);});
 
   //
@@ -3329,7 +3488,7 @@ void setup(void) {
       delete body; // Clean up memory
       request->_tempObject = nullptr;
 
-      if ((!railIsSet && !tubeIsSet && !busIsSet) || (!nrToken[0] && rdmDeparturesApiKey=="" && boardMode==MODE_RAIL) || request->hasParam("reboot")) {
+      if ((!railIsSet && !tubeIsSet && !busIsSet && !freightIsSet) || (!nrToken[0] && rdmDeparturesApiKey=="" && boardMode==MODE_RAIL) || request->hasParam("reboot")) {
         // First time setup or base config change, we need a full reboot
         sendResponse(200,"Configuration saved. The Departures Board will now restart.",request);
         restartTimer.once(1, []() { ESP.restart(); });
@@ -3385,7 +3544,7 @@ void setup(void) {
         // Load/Update the API Keys in memory
         loadApiKeys();
         // If all location codes are blank we're in the setup process. If not, the keys have been changed so just reboot.
-        if (!railIsSet && !tubeIsSet && !busIsSet) {
+        if (!railIsSet && !tubeIsSet && !busIsSet && !freightIsSet) {
           sendResponse(200,msg,request);
           writeDefaultConfig();
           showSetupCrsHelpScreen();
@@ -3514,7 +3673,7 @@ void setup(void) {
   }
   checkPostWebUpgrade();
   // First time configuration?
-  if ((!railIsSet && !tubeIsSet && !busIsSet) || (!nrToken[0] && rdmDeparturesApiKey=="" && boardMode==MODE_RAIL)) {
+  if ((!railIsSet && !tubeIsSet && !busIsSet && !freightIsSet) || (!nrToken[0] && rdmDeparturesApiKey=="" && boardMode==MODE_RAIL)) {
     if (!apiKeys) showSetupKeysHelpScreen();
     else showSetupCrsHelpScreen();
     // First time setup mode will exit with a reboot, so just loop here forever
@@ -3554,7 +3713,7 @@ void setup(void) {
   loadConfig();
 
   station.numServices=0;
-  if (rssEnabled && boardMode!=MODE_BUS) {
+  if (rssEnabled && !BUSLAYOUT) {
     progressBar("Loading RSS headlines feed",60);
     updateRssFeed();
   }
@@ -3595,6 +3754,9 @@ void setup(void) {
       progressBar("Initialising BusTimes interface",70);
       // Create a cleaned filter
       busdata.cleanFilter(locationFilter,locationCleanFilter,sizeof(locationFilter));
+      startupProgressPercent=70;  } else if (boardMode == MODE_FREIGHT) {
+      progressBar("Initialising freight-tracker interface",70);
+      locationCleanFilter[0] = '\0';
       startupProgressPercent=70;
   }
 }
@@ -3683,13 +3845,14 @@ void loop(void) {
       break;
 
     case MODE_BUS:
+    case MODE_FREIGHT:
       busDeparturesLoop();
       break;
   }
 
   if (manualUpdateCheck && !fetchInProgress) doManualOtaCheck();
 
-  if (rssEnabled && boardMode != MODE_BUS && millis() > nextRssUpdate && !fetchInProgress && !isSleeping && wifiConnected) {
+  if (rssEnabled && !BUSLAYOUT && millis() > nextRssUpdate && !fetchInProgress && !isSleeping && wifiConnected) {
     // Start an RSS Update on Core 0
     fetchMode = FETCH_RSS;
     fetchInProgress = true;
